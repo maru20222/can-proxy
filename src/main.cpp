@@ -73,6 +73,8 @@ static constexpr uint32_t POLL_RETRY_MS    = 1000;   // まだ一度も取得で
 static constexpr uint32_t POLL_TIMEOUT_MS  = 50;
 static constexpr uint32_t POLL_PENDING_MS  = 500;    // NRC 0x78（応答保留）受信時の待ち延長
 static constexpr uint32_t POLL_MIN_GAP_MS  = 5;      // ポーリング送信の最小間隔
+static constexpr uint32_t POLL_IDLE_MS     = 2000;   // R-VIT がこの時間要求してこない DID はポーリングしない
+                                                     // （R-VIT 側で表示をやめた項目は ECM に問い合わせない）
 
 // パススルー: 未知リクエストを車両へ流した後、この時間は診断応答 (0x7E8-0x7EF) を R-VIT へ返す
 static constexpr uint32_t PASSTHROUGH_WINDOW_MS = 300;
@@ -107,7 +109,14 @@ struct DidEntry {
   bool        everPolled;
   uint32_t    lastPollMs;
   uint32_t    proxyCount;
+  bool        requested;       // R-VIT から一度でも要求されたか
+  uint32_t    lastRequestMs;   // R-VIT から最後に要求された時刻
 };
+
+// R-VIT が現在この DID を要求しているか（ポーリング対象の判定）
+static inline bool isRequested(const DidEntry &e, uint32_t now) {
+  return e.requested && (now - e.lastRequestMs) < POLL_IDLE_MS;
+}
 
 // R-VIT がリクエストしてくる DID（フレーム解析.md「フレーム解析」節）
 // 初期値はログで観測した値（アイドリング付近）
@@ -296,6 +305,7 @@ static void servicePolling(uint32_t now) {
   uint32_t bestOverdue = 0;
   for (auto &e : g_dids) {
     if (e.src != Source::Poll) continue;
+    if (!isRequested(e, now)) continue;  // R-VIT が表示していない項目は問い合わせない
     uint32_t overdue;
     if (!e.everPolled) {
       overdue = UINT32_MAX;
@@ -412,6 +422,8 @@ static void onRvitFrame(const CAN_message_t &m) {
     const uint16_t did = ((uint16_t)m.buf[2] << 8) | m.buf[3];
     DidEntry *e = findDid(did);
     if (e) {
+      e->requested     = true;
+      e->lastRequestMs = now;
       sendProxyResponse(*e);
       return;
     }
@@ -488,8 +500,9 @@ static void printStatus() {
     char age[12];
     if (e.valid) snprintf(age, sizeof(age), "%lu", (unsigned long)(now - e.updatedMs));
     else         snprintf(age, sizeof(age), "default");
+    const char *src = e.src == Source::Broadcast ? "bcast" : (isRequested(e, now) ? "poll" : "idle");
     Serial.printf(" %04X %-11s %-5s %-7s %8s %8lu  ",
-                  e.did, e.name, e.src == Source::Poll ? "poll" : "bcast", raw, age,
+                  e.did, e.name, src, raw, age,
                   (unsigned long)e.proxyCount);
     printPhysical(e);
     Serial.println();
