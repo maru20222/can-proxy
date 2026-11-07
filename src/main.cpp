@@ -67,7 +67,7 @@ static constexpr uint32_t ID_SPEED    = 0x284;
 static constexpr uint32_t ID_COOLANT  = 0x551;
 
 // Teensy -> ECM ポーリング
-static constexpr uint32_t POLL_FAST_MS     = 30;     // R-VIT 実測の一巡周期（約25〜30ms）相当
+static constexpr uint32_t POLL_FAST_MS     = 500;     // R-VIT 実測の一巡周期（約25〜30ms）相当
 static constexpr uint32_t POLL_SLOW_MS     = 10000;  // 10秒毎
 static constexpr uint32_t POLL_RETRY_MS    = 1000;   // まだ一度も取得できていない DID の再試行間隔
 static constexpr uint32_t POLL_TIMEOUT_MS  = 50;
@@ -82,6 +82,7 @@ static constexpr uint32_t PASSTHROUGH_WINDOW_MS = 300;
 static constexpr uint32_t LED_ON_MS            = 20;
 static constexpr uint32_t UNKNOWN_LOG_PER_SEC  = 10;
 static constexpr uint32_t AUTO_STATUS_MS       = 1000;
+static constexpr uint32_t BCAST_DUMP_MS        = 10000;  // 車両ブロードキャスト最新フレームのダンプ周期
 
 // ============================================================================
 // 実行時の状態
@@ -94,6 +95,7 @@ static bool g_passUnknown  = true;         // 未知リクエストを車両へ�
 static bool g_forwardBcast = false;        // Proxy モードで車両ブロードキャストを R-VIT へ転送する
 static bool g_verbose      = false;
 static bool g_autoStatus   = false;
+static bool g_bcastDump    = true;         // 車両ブロードキャスト最新フレームを定期表示
 
 enum class Source : uint8_t { Broadcast, Poll };
 
@@ -131,6 +133,24 @@ static DidEntry g_dids[] = {
   { 0x111F, 1, Source::Poll,      POLL_SLOW_MS, "OilTemp",    {0x85, 0x00} },
   { 0x1225, 2, Source::Poll,      POLL_FAST_MS, "AF_B1S1",    {0x01, 0x3A} },
 };
+
+// 車両ブロードキャストの最新フレーム（全バイト）を保持して定期ダンプする
+struct BcastSnap {
+  uint32_t      id;
+  uint16_t      did;   // 変換先 DID（比較用）
+  const char   *name;
+  CAN_message_t msg;
+  bool          valid;
+  uint32_t      rxMs;
+  uint32_t      count;
+};
+static BcastSnap g_bcastSnaps[] = {
+  { ID_THROTTLE, 0x111E, "Throttle" },
+  { ID_RPM,      0x1201, "EngineRPM" },
+  { ID_SPEED,    0x1102, "Speed" },
+  { ID_COOLANT,  0x1101, "Coolant" },
+};
+static uint32_t g_lastBcastDump = 0;
 
 struct Stats {
   uint32_t carRx, carTx, carTxFail;
@@ -208,6 +228,43 @@ static void setDidValue(uint16_t did, uint16_t v, uint32_t now) {
   }
   e->valid     = true;
   e->updatedMs = now;
+}
+
+// ============================================================================
+// 車両ブロードキャスト最新フレームの記録 / ダンプ
+// ============================================================================
+static void recordBroadcast(const CAN_message_t &m, uint32_t now) {
+  for (auto &s : g_bcastSnaps) {
+    if (s.id != m.id) continue;
+    s.msg   = m;
+    s.valid = true;
+    s.rxMs  = now;
+    s.count++;
+    return;
+  }
+}
+
+static void printBcastDump(uint32_t now) {
+  Serial.printf("---- bcast latest @%lu ms ----\n", (unsigned long)now);
+  for (const auto &s : g_bcastSnaps) {
+    Serial.printf(" %03lX %-9s ", (unsigned long)s.id, s.name);
+    if (!s.valid) {
+      Serial.println("(no frame)");
+      continue;
+    }
+    Serial.printf("[%u]", s.msg.len);
+    for (uint8_t i = 0; i < 8; i++) {
+      if (i < s.msg.len) Serial.printf(" %02X", s.msg.buf[i]);
+      else               Serial.print("   ");
+    }
+    Serial.printf("  age=%lums cnt=%lu", (unsigned long)(now - s.rxMs), (unsigned long)s.count);
+    const DidEntry *e = findDid(s.did);
+    if (e) {
+      if (e->len == 1) Serial.printf("  -> DID %04X = %02X", e->did, e->value[0]);
+      else             Serial.printf("  -> DID %04X = %02X %02X", e->did, e->value[0], e->value[1]);
+    }
+    Serial.println();
+  }
 }
 
 // ============================================================================
@@ -375,6 +432,7 @@ static void onCarFrame(const CAN_message_t &m) {
   const uint32_t now = millis();
   g_stats.carRx++;
 
+  recordBroadcast(m, now);
   decodeBroadcast(m, now);  // どのモードでもキャッシュは更新する
 
   if (g_mode == Mode::Bridge) {
@@ -459,6 +517,8 @@ static void printHelp() {
   Serial.println(" u      : unknown request passthrough ON/OFF");
   Serial.println(" f      : forward vehicle broadcast to R-VIT ON/OFF (PROXY)");
   Serial.println(" v      : verbose ON/OFF");
+  Serial.println(" d      : vehicle broadcast latest frame dump (10s) ON/OFF");
+  Serial.println(" D      : vehicle broadcast latest frame dump (now)");
   Serial.println(" r      : reset counters");
   Serial.println();
 }
@@ -531,6 +591,8 @@ static void handleSerial() {
       case 'u': g_passUnknown = !g_passUnknown; Serial.printf("passUnknown=%s\n", onOff(g_passUnknown)); break;
       case 'f': g_forwardBcast = !g_forwardBcast; Serial.printf("fwdBcast=%s\n", onOff(g_forwardBcast)); break;
       case 'v': g_verbose = !g_verbose; Serial.printf("verbose=%s\n", onOff(g_verbose)); break;
+      case 'd': g_bcastDump = !g_bcastDump; Serial.printf("bcastDump=%s\n", onOff(g_bcastDump)); break;
+      case 'D': printBcastDump(millis()); break;
       case 'r': {
         g_stats = {};
         for (auto &e : g_dids) e.proxyCount = 0;
@@ -652,6 +714,11 @@ void loop() {
   if (g_autoStatus && now - g_lastAutoStatus >= AUTO_STATUS_MS) {
     g_lastAutoStatus = now;
     printStatus();
+  }
+
+  if (g_bcastDump && now - g_lastBcastDump >= BCAST_DUMP_MS) {
+    g_lastBcastDump = now;
+    printBcastDump(now);
   }
 
   handleSerial();
