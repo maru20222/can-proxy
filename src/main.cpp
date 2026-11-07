@@ -96,6 +96,7 @@ static bool g_forwardBcast = false;        // Proxy モードで車両ブロー�
 static bool g_verbose      = false;
 static bool g_autoStatus   = false;
 static bool g_bcastDump    = true;         // 車両ブロードキャスト最新フレームを定期表示
+static bool g_verify       = true;         // 換算値と ECM 実値の照合（差分をログ出力）
 
 enum class Source : uint8_t { Broadcast, Poll };
 
@@ -103,7 +104,7 @@ struct DidEntry {
   uint16_t    did;
   uint8_t     len;             // 応答データ長 (1 or 2 byte)
   Source      src;
-  uint32_t    pollIntervalMs;  // Source::Poll のみ
+  uint32_t    pollIntervalMs;  // Source::Poll: ポーリング周期 / Source::Broadcast: ECM 実値との照合周期（0 = 照合しない）
   const char *name;
   uint8_t     value[2];        // 現在値（初期値 = 実データ受信前に返す値）
   bool        valid;           // 実データで一度でも更新されたか
@@ -113,6 +114,11 @@ struct DidEntry {
   uint32_t    proxyCount;
   bool        requested;       // R-VIT から一度でも要求されたか
   uint32_t    lastRequestMs;   // R-VIT から最後に要求された時刻
+  // ECM 実値との照合統計（Source::Broadcast のみ）
+  uint32_t    cmpCount;
+  uint32_t    cmpAbsSum;
+  uint16_t    cmpMaxAbs;
+  uint32_t    lastCmpPrintMs;
 };
 
 // R-VIT が現在この DID を要求しているか（ポーリング対象の判定）
@@ -122,11 +128,13 @@ static inline bool isRequested(const DidEntry &e, uint32_t now) {
 
 // R-VIT がリクエストしてくる DID（フレーム解析.md「フレーム解析」節）
 // 初期値はログで観測した値（アイドリング付近）
+// Broadcast の interval を設定すると、その周期で ECM にも問い合わせて換算値との差をログする
+// （R-VIT への応答は換算値のまま。c コマンドで ON/OFF）
 static DidEntry g_dids[] = {
   // did     len src                interval      name          初期値
   { 0x1101, 1, Source::Broadcast, 0,            "Coolant",    {0x88, 0x00} },  // 0x551 B0 + 10（= 水温+50）
   { 0x1102, 1, Source::Broadcast, 0,            "Speed",      {0x00, 0x00} },  // 0x284 B4-5 / 100 / 2
-  { 0x111E, 1, Source::Broadcast, 0,            "Throttle",   {0x00, 0x00} },  // 0x160 B3 + B4上位2bit (10bit) → テーブル換算
+  { 0x111E, 1, Source::Broadcast, POLL_FAST_MS, "Throttle",   {0x00, 0x00} },  // 0x160 B3 + B4上位2bit (10bit) → テーブル換算（ECM と照合）
   { 0x1201, 2, Source::Broadcast, 0,            "EngineRPM",  {0x00, 0x00} },  // 0x1F9 B2-3 / 100
   { 0x1106, 1, Source::Poll,      POLL_SLOW_MS, "IntakeTemp", {0x5C, 0x00} },
   { 0x110A, 1, Source::Poll,      POLL_FAST_MS, "IgnTiming",  {0x58, 0x00} },
@@ -337,6 +345,69 @@ static void decodeBroadcast(const CAN_message_t &m, uint32_t now) {
 }
 
 // ============================================================================
+// 換算値と ECM 実値の照合
+// ============================================================================
+//   PROXY  : Broadcast DID のうち interval を設定したものを Teensy が ECM に問い合わせて比較
+//   BRIDGE : R-VIT 自身の問い合わせに対する ECM 応答を盗み見して比較（全 Broadcast DID）
+//   ログ形式（DID ごとに最大 POLL_FAST_MS に 1 行。統計は全件、s コマンドで表示）:
+//     <ms> CMP <poll|bridge> <DID> <name> ecm=<ECM実値> calc=<換算値> diff=<calc-ecm> | rpm= kmh= [pedal= kd= idle= 160=<全バイト>]
+static const BcastSnap *findSnap(uint32_t id) {
+  for (const auto &s : g_bcastSnaps) {
+    if (s.id == id) return s.valid ? &s : nullptr;
+  }
+  return nullptr;
+}
+
+static void compareWithEcm(DidEntry &e, const uint8_t *data, uint8_t n, uint32_t now, const char *how) {
+  if (n < e.len) return;
+  const uint16_t ecm  = e.len == 1 ? data[0] : (uint16_t)((data[0] << 8) | data[1]);
+  const uint16_t calc = e.len == 1 ? e.value[0] : (uint16_t)((e.value[0] << 8) | e.value[1]);
+  const int32_t  diff = (int32_t)calc - (int32_t)ecm;
+  const uint16_t absd = (uint16_t)(diff < 0 ? -diff : diff);
+
+  if (e.valid) {  // まだブロードキャストを受信していない（初期値）ときは統計に入れない
+    e.cmpCount++;
+    e.cmpAbsSum += absd;
+    if (absd > e.cmpMaxAbs) e.cmpMaxAbs = absd;
+  }
+
+  if (now - e.lastCmpPrintMs < POLL_FAST_MS) return;  // ブリッジ時は R-VIT の問い合わせが多いので間引く
+  e.lastCmpPrintMs = now;
+
+  Serial.printf("%10lu CMP %-6s %04X %-10s ecm=%u calc=%u%s diff=%+ld |", (unsigned long)now, how, e.did,
+                e.name, ecm, calc, e.valid ? "" : "(default)", (long)diff);
+  if (const BcastSnap *s = findSnap(ID_RPM)) {
+    if (s->msg.len >= 4) Serial.printf(" rpm=%u", (unsigned)((((uint16_t)s->msg.buf[2] << 8) | s->msg.buf[3]) / 8));
+  }
+  if (const BcastSnap *s = findSnap(ID_SPEED)) {
+    if (s->msg.len >= 6) Serial.printf(" kmh=%u", (unsigned)((((uint16_t)s->msg.buf[4] << 8) | s->msg.buf[5]) / 100));
+  }
+  if (e.did == 0x111E) {
+    if (const BcastSnap *s = findSnap(ID_THROTTLE)) {
+      const uint8_t *b = s->msg.buf;
+      if (s->msg.len >= 5) {
+        Serial.printf(" pedal=%u kd=%u idle=%u", (unsigned)(((uint16_t)b[3] << 2) | (b[4] >> 6)),
+                      (unsigned)((b[4] >> 5) & 1), (unsigned)((b[4] >> 3) & 1));
+      }
+      Serial.print(" 160=");
+      for (uint8_t i = 0; i < s->msg.len && i < 8; i++) Serial.printf("%s%02X", i ? " " : "", b[i]);
+    }
+  }
+  Serial.println();
+}
+
+// BRIDGE モード: R-VIT の問い合わせに対する ECM 応答（62 DIDh DIDl ...）を照合に使う
+static void checkBridgeResponse(const CAN_message_t &m, uint32_t now) {
+  if (m.id != ID_ECM_RES || m.len < 5) return;
+  const uint8_t pci = m.buf[0];
+  if ((pci & 0xF0) != 0x00) return;  // シングルフレームのみ
+  const uint8_t sfLen = pci & 0x0F;
+  if (sfLen < 4 || m.buf[1] != SID_READ_DID_POS) return;
+  DidEntry *e = findDid(((uint16_t)m.buf[2] << 8) | m.buf[3]);
+  if (e && e->src == Source::Broadcast) compareWithEcm(*e, &m.buf[4], sfLen - 3, now, "bridge");
+}
+
+// ============================================================================
 // Teensy -> ECM ポーリング
 // ============================================================================
 static bool handlePollResponse(const CAN_message_t &m, uint32_t now) {
@@ -353,10 +424,14 @@ static bool handlePollResponse(const CAN_message_t &m, uint32_t now) {
     DidEntry *e = findDid(did);
     if (e) {
       uint8_t n = sfLen - 3;
-      if (n > e->len) n = e->len;
-      for (uint8_t i = 0; i < n; i++) e->value[i] = m.buf[4 + i];
-      e->valid     = true;
-      e->updatedMs = now;
+      if (e->src == Source::Broadcast) {
+        compareWithEcm(*e, &m.buf[4], n, now, "poll");  // 照合用: 換算値は上書きしない
+      } else {
+        if (n > e->len) n = e->len;
+        for (uint8_t i = 0; i < n; i++) e->value[i] = m.buf[4 + i];
+        e->valid     = true;
+        e->updatedMs = now;
+      }
     }
     g_poll.pending = false;
     g_stats.pollOk++;
@@ -396,8 +471,11 @@ static void servicePolling(uint32_t now) {
   DidEntry *best = nullptr;
   uint32_t bestOverdue = 0;
   for (auto &e : g_dids) {
-    if (e.src != Source::Poll) continue;
-    if (!isRequested(e, now)) continue;  // R-VIT が表示していない項目は問い合わせない
+    if (e.src == Source::Poll) {
+      if (!isRequested(e, now)) continue;  // R-VIT が表示していない項目は問い合わせない
+    } else {
+      if (!g_verify || e.pollIntervalMs == 0) continue;  // Broadcast は照合対象のみ
+    }
     uint32_t overdue;
     if (!e.everPolled) {
       overdue = UINT32_MAX;
@@ -472,6 +550,7 @@ static void onCarFrame(const CAN_message_t &m) {
 
   if (g_mode == Mode::Bridge) {
     sendRvit(cloneFrame(m));
+    if (g_verify) checkBridgeResponse(m, now);
     if (g_verbose && m.id >= ID_DIAG_RES_MIN && m.id <= ID_DIAG_RES_MAX) printFrame("CAR>RVIT", m);
     return;
   }
@@ -554,6 +633,7 @@ static void printHelp() {
   Serial.println(" v      : verbose ON/OFF");
   Serial.println(" d      : vehicle broadcast latest frame dump (10s) ON/OFF");
   Serial.println(" D      : vehicle broadcast latest frame dump (now)");
+  Serial.println(" c      : verify calc vs ECM ON/OFF (PROXY: 111E を 500ms で ECM に問合せ / BRIDGE: R-VIT 応答を盗み見)");
   Serial.println(" r      : reset counters");
   Serial.println();
 }
@@ -562,6 +642,7 @@ static void printPhysical(const DidEntry &e) {
   switch (e.did) {
     case 0x1101: Serial.printf("%4d degC", (int)e.value[0] - 50); break;
     case 0x1102: Serial.printf("%4u km/h", (unsigned)e.value[0] * 2); break;
+    case 0x111E: Serial.printf("%5.1f %%", (double)(e.value[0] * 100.0f / 255.0f)); break;
     case 0x1201: Serial.printf("%6.1f rpm", (double)(((e.value[0] << 8) | e.value[1]) * 12.5f)); break;
     default:     Serial.print("-"); break;
   }
@@ -572,9 +653,9 @@ static void printStatus() {
   Serial.println();
   Serial.printf("==== can-proxy status  uptime %lu.%03lus ====\n",
                 (unsigned long)(now / 1000), (unsigned long)(now % 1000));
-  Serial.printf("mode=%s poll=%s passUnknown=%s fwdBcast=%s verbose=%s\n",
+  Serial.printf("mode=%s poll=%s passUnknown=%s fwdBcast=%s verify=%s verbose=%s\n",
                 modeName(g_mode), onOff(g_pollEnabled), onOff(g_passUnknown),
-                onOff(g_forwardBcast), onOff(g_verbose));
+                onOff(g_forwardBcast), onOff(g_verify), onOff(g_verbose));
   Serial.printf("CAR : rx=%lu tx=%lu txFail=%lu\n",
                 (unsigned long)g_stats.carRx, (unsigned long)g_stats.carTx, (unsigned long)g_stats.carTxFail);
   Serial.printf("RVIT: rx=%lu tx=%lu txFail=%lu  rx/s=%lu\n",
@@ -602,6 +683,11 @@ static void printStatus() {
     printPhysical(e);
     Serial.println();
   }
+  for (const auto &e : g_dids) {
+    if (e.src != Source::Broadcast || e.cmpCount == 0) continue;
+    Serial.printf(" verify %04X %-11s n=%lu  mean|diff|=%.2f  max|diff|=%u\n", e.did, e.name,
+                  (unsigned long)e.cmpCount, (double)e.cmpAbsSum / e.cmpCount, e.cmpMaxAbs);
+  }
   Serial.println();
 }
 
@@ -628,9 +714,15 @@ static void handleSerial() {
       case 'v': g_verbose = !g_verbose; Serial.printf("verbose=%s\n", onOff(g_verbose)); break;
       case 'd': g_bcastDump = !g_bcastDump; Serial.printf("bcastDump=%s\n", onOff(g_bcastDump)); break;
       case 'D': printBcastDump(millis()); break;
+      case 'c': g_verify = !g_verify; g_poll.pending = false;
+                Serial.printf("verify=%s\n", onOff(g_verify)); break;
       case 'r': {
         g_stats = {};
-        for (auto &e : g_dids) e.proxyCount = 0;
+        for (auto &e : g_dids) {
+          e.proxyCount = 0;
+          e.cmpCount = e.cmpAbsSum = 0;
+          e.cmpMaxAbs = 0;
+        }
         Serial.println("counters reset");
         break;
       }
