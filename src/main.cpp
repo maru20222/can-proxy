@@ -126,7 +126,7 @@ static DidEntry g_dids[] = {
   // did     len src                interval      name          初期値
   { 0x1101, 1, Source::Broadcast, 0,            "Coolant",    {0x88, 0x00} },  // 0x551 B0 + 10（= 水温+50）
   { 0x1102, 1, Source::Broadcast, 0,            "Speed",      {0x00, 0x00} },  // 0x284 B4-5 / 100 / 2
-  { 0x111E, 1, Source::Broadcast, 0,            "Throttle",   {0x00, 0x00} },  // 0x160 B2-3 上位9bit
+  { 0x111E, 1, Source::Broadcast, 0,            "Throttle",   {0x00, 0x00} },  // 0x160 B3 + B4上位2bit (10bit) → テーブル換算
   { 0x1201, 2, Source::Broadcast, 0,            "EngineRPM",  {0x00, 0x00} },  // 0x1F9 B2-3 / 100
   { 0x1106, 1, Source::Poll,      POLL_SLOW_MS, "IntakeTemp", {0x5C, 0x00} },
   { 0x110A, 1, Source::Poll,      POLL_FAST_MS, "IgnTiming",  {0x58, 0x00} },
@@ -268,6 +268,40 @@ static void printBcastDump(uint32_t now) {
 }
 
 // ============================================================================
+// アクセルペダル位置 (0x160) -> DID 111E (スロットル開度, 255 = 100%)
+// ============================================================================
+//   0x160 B3 全bit + B4 bit7-6 = ペダル位置 10bit (0 = 解放, 792 = 踏み込み75%以上で飽和)
+//   B4 bit5 = キックダウン域（踏み込み75%以上）, B5-B6 は B3-B4 の反転コピー（誤り検出用）
+//   参考: https://github.com/balrog-kun/nissan-qashqai-can-info 「160 D.8-E.7」
+//
+//   ECM の DID 111E はペダル位置そのものではなくスロットルバルブ開度（ペダル→スロットルの
+//   非線形マップを通した値）なので、割り算では合わない。
+//   STM32G4 CANLOG/2.log.csv, log.log.csv で R-VIT → ECM の実応答と直前の 0x160 を突き合わせ、
+//   安定区間の中央値から作った折れ線テーブルで換算する（相関 r=0.95, 平均誤差 ±3 程度）。
+//   ペダル 312 (≈DID 156 = 61%) より上はログに無いため 792 = 255 へ直線外挿。
+struct ThrottlePoint { uint16_t pedal; uint8_t did; };
+static constexpr ThrottlePoint THROTTLE_MAP[] = {
+  {   0,   0 }, {  12,   0 }, {  24,   5 }, {  40,  12 }, {  56,  24 }, {  72,  26 },
+  {  88,  30 }, { 104,  31 }, { 120,  34 }, { 136,  36 }, { 152,  40 }, { 168,  43 },
+  { 184,  51 }, { 200,  66 }, { 216,  75 }, { 232,  90 }, { 248, 114 }, { 264, 139 },
+  { 280, 146 }, { 296, 154 }, { 312, 156 }, { 792, 255 },
+};
+static constexpr uint16_t PEDAL_MAX = 792;
+
+static uint8_t pedalToThrottleDid(uint16_t pedal) {
+  constexpr size_t N = sizeof(THROTTLE_MAP) / sizeof(THROTTLE_MAP[0]);
+  if (pedal >= THROTTLE_MAP[N - 1].pedal) return THROTTLE_MAP[N - 1].did;
+  for (size_t i = 1; i < N; i++) {
+    const ThrottlePoint &a = THROTTLE_MAP[i - 1];
+    const ThrottlePoint &b = THROTTLE_MAP[i];
+    if (pedal < b.pedal) {
+      return (uint8_t)(a.did + (int32_t)(b.did - a.did) * (pedal - a.pedal) / (b.pedal - a.pedal));
+    }
+  }
+  return THROTTLE_MAP[N - 1].did;
+}
+
+// ============================================================================
 // 車両ブロードキャスト -> DID 値へ変換（フレーム解析.md 参照）
 // ============================================================================
 static void decodeBroadcast(const CAN_message_t &m, uint32_t now) {
@@ -282,10 +316,11 @@ static void decodeBroadcast(const CAN_message_t &m, uint32_t now) {
       }
       break;
     }
-    case ID_THROTTLE: {  // B2 全bit + B3 MSB の 9bit
-      if (m.len >= 4) {
-        uint32_t raw9 = ((uint32_t)m.buf[2] << 1) | (m.buf[3] >> 7);
-        setDidValue(0x111E, raw9, now);  // 255超はクランプ
+    case ID_THROTTLE: {  // B3 全bit + B4 bit7-6 の 10bit ペダル位置 → テーブル換算
+      if (m.len >= 5) {
+        uint16_t pedal = ((uint16_t)m.buf[3] << 2) | (m.buf[4] >> 6);
+        if (m.buf[4] & 0x20) pedal = PEDAL_MAX;  // キックダウン域
+        setDidValue(0x111E, pedalToThrottleDid(pedal), now);
       }
       break;
     }
