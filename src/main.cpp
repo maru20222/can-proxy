@@ -183,6 +183,7 @@ static bool     g_ledOn    = false;
 
 static uint32_t g_rateWindowStart = 0, g_rateWindowCount = 0, g_rvitReqPerSec = 0;
 static uint32_t g_unknownWindowStart = 0, g_unknownWindowCount = 0;
+static uint32_t g_passWindowStart = 0, g_passWindowCount = 0;
 static uint32_t g_lastAutoStatus = 0;
 
 // ============================================================================
@@ -365,20 +366,26 @@ static void compareWithEcm(DidEntry &e, const uint8_t *data, uint8_t n, uint32_t
   const int32_t  diff = (int32_t)calc - (int32_t)ecm;
   const uint16_t absd = (uint16_t)(diff < 0 ? -diff : diff);
 
-  if (e.valid) {  // まだブロードキャストを受信していない（初期値）ときは統計に入れない
+  int32_t rpm = -1;  // -1: 不明
+  if (const BcastSnap *s = findSnap(ID_RPM)) {
+    if (s->msg.len >= 4) rpm = (int32_t)((((uint16_t)s->msg.buf[2] << 8) | s->msg.buf[3]) / 8);
+  }
+  // まだブロードキャストを受信していない（初期値）とき、およびエンジン停止中は統計に入れない
+  // （停止直後に ECM がスロットル自己診断で 111E を動かすため）
+  const bool counted = e.valid && rpm != 0;
+  if (counted) {
     e.cmpCount++;
     e.cmpAbsSum += absd;
     if (absd > e.cmpMaxAbs) e.cmpMaxAbs = absd;
   }
 
-  if (now - e.lastCmpPrintMs < POLL_FAST_MS) return;  // ブリッジ時は R-VIT の問い合わせが多いので間引く
+  // ブリッジ時は R-VIT の問い合わせが多いので間引く（ポーリング周期のジッタで 1 回おきに落ちないよう 10% 余裕）
+  if (now - e.lastCmpPrintMs < POLL_FAST_MS * 9 / 10) return;
   e.lastCmpPrintMs = now;
 
-  Serial.printf("%10lu CMP %-6s %04X %-10s ecm=%u calc=%u%s diff=%+ld |", (unsigned long)now, how, e.did,
-                e.name, ecm, calc, e.valid ? "" : "(default)", (long)diff);
-  if (const BcastSnap *s = findSnap(ID_RPM)) {
-    if (s->msg.len >= 4) Serial.printf(" rpm=%u", (unsigned)((((uint16_t)s->msg.buf[2] << 8) | s->msg.buf[3]) / 8));
-  }
+  Serial.printf("%10lu CMP %-6s %04X %-10s ecm=%u calc=%u%s diff=%+ld%s |", (unsigned long)now, how, e.did,
+                e.name, ecm, calc, e.valid ? "" : "(default)", (long)diff, counted ? "" : " (nostat)");
+  if (rpm >= 0) Serial.printf(" rpm=%ld", (long)rpm);
   if (const BcastSnap *s = findSnap(ID_SPEED)) {
     if (s->msg.len >= 6) Serial.printf(" kmh=%u", (unsigned)((((uint16_t)s->msg.buf[4] << 8) | s->msg.buf[5]) / 100));
   }
@@ -561,7 +568,11 @@ static void onCarFrame(const CAN_message_t &m) {
     if (!timeReached(now, g_passthroughUntil)) {      // R-VIT の素通しリクエストへの応答
       sendRvit(cloneFrame(m));
       g_stats.passToRvit++;
-      printFrame("PASS<CAR", m);
+      if (now - g_passWindowStart >= 1000) {  // 17 FF 連打などで溢れないよう 1 秒あたりの表示数を制限
+        g_passWindowStart = now;
+        g_passWindowCount = 0;
+      }
+      if (g_passWindowCount++ < UNKNOWN_LOG_PER_SEC) printFrame("PASS<CAR", m);
     }
     return;
   }
