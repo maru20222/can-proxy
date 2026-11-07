@@ -67,7 +67,7 @@ static constexpr uint32_t ID_SPEED    = 0x284;
 static constexpr uint32_t ID_COOLANT  = 0x551;
 
 // Teensy -> ECM ポーリング
-static constexpr uint32_t POLL_FAST_MS     = 500;     // R-VIT 実測の一巡周期（約25〜30ms）相当
+static constexpr uint32_t POLL_FAST_MS     = 500;    // 高頻度項目（点火時期・A/F）のポーリング / 111E 照合の周期
 static constexpr uint32_t POLL_SLOW_MS     = 10000;  // 10秒毎
 static constexpr uint32_t POLL_RETRY_MS    = 1000;   // まだ一度も取得できていない DID の再試行間隔
 static constexpr uint32_t POLL_TIMEOUT_MS  = 50;
