@@ -6,6 +6,8 @@
  *   - R-VIT の CAN H/L を車両から切り離し、Teensy が ECM (0x7E0/0x7E8) の代わりに応答する。
  *   - 応答値は「車両ブロードキャストから算出」または「Teensy が自分で ECM に問い合わせた値」をキャッシュしたもの。
  *   - 未知のリクエストは車両へ素通し（パススルー）し、ECU の応答を R-VIT へ返す。
+ *   - R-VIT の CAN H/L は切替リレー (TQ2-5V) 経由。リレー OFF（無通電・起動中・ハング）で
+ *     R-VIT は車両に直結（物理スルー）、setup() 完了後にリレー ON で Teensy 経由になる。
  *
  * ピンアサイン・配線・操作方法は README.md を参照。
  * DID の解析根拠は フレーム解析.md を参照。
@@ -33,10 +35,12 @@
 //                    pin 23 = CRX1 <- CAN Pal #1 "RX"
 //   CAN3 (R-VIT側) : pin 31 = CTX3 -> CAN Pal #2 "TX"
 //                    pin 30 = CRX3 <- CAN Pal #2 "RX"
+//   リレー         : pin 2  -> 1kΩ -> 2SC1815 ベース（10kΩ でプルダウン）。HIGH = Teensy 経由
 //   LED            : pin 13 (オンボードLED) R-VIT からの受信で点灯
 //   ※ pin 0/1 (CAN2 / Serial1) は将来の VDC-CAN またはラズパイ連携用に空けておく
 //   ※ FlexCAN_T4 は CAN1=22/23, CAN3=30/31 固定なのでコード上でのピン指定は不要
-static constexpr uint8_t PIN_LED = LED_BUILTIN;
+static constexpr uint8_t PIN_LED   = LED_BUILTIN;
+static constexpr uint8_t PIN_RELAY = 2;
 
 FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_64>  canCar;   // 車両側
 FlexCAN_T4<CAN3, RX_SIZE_256, TX_SIZE_256> canRvit;  // R-VIT側（ブリッジモードで車両の全フレームを流すので TX 大きめ）
@@ -84,6 +88,10 @@ static constexpr uint32_t UNKNOWN_LOG_PER_SEC  = 10;
 static constexpr uint32_t AUTO_STATUS_MS       = 1000;
 static constexpr uint32_t BCAST_DUMP_MS        = 10000;  // 車両ブロードキャスト最新フレームのダンプ周期
 
+// ウォッチドッグ（WDOG1）: loop() がこの時間止まると Teensy をリセット -> リレー OFF（物理スルー）
+// タイムアウト = (WT + 1) x 0.5s。USB シリアルの書き込み待ちで誤リセットしないよう余裕を持たせる
+static constexpr uint8_t WDT_WT = 3;  // 2.0s
+
 // ============================================================================
 // 実行時の状態
 // ============================================================================
@@ -97,6 +105,8 @@ static bool g_verbose      = false;
 static bool g_autoStatus   = false;
 static bool g_bcastDump    = true;         // 車両ブロードキャスト最新フレームを定期表示
 static bool g_verify       = true;         // 換算値と ECM 実値の照合（差分をログ出力）
+static bool g_relayOn      = false;        // 切替リレー（true = R-VIT は Teensy 経由 / false = 車両直結）
+static bool g_wdtReset     = false;        // 前回のリセット要因がウォッチドッグ
 
 enum class Source : uint8_t { Broadcast, Poll };
 
@@ -645,6 +655,7 @@ static void printHelp() {
   Serial.println(" d      : vehicle broadcast latest frame dump (10s) ON/OFF");
   Serial.println(" D      : vehicle broadcast latest frame dump (now)");
   Serial.println(" c      : verify calc vs ECM ON/OFF (PROXY: 111E を 500ms で ECM に問合せ / BRIDGE: R-VIT 応答を盗み見)");
+  Serial.println(" x      : relay ON/OFF (OFF = R-VIT を車両に直結 = 物理スルー)");
   Serial.println(" r      : reset counters");
   Serial.println();
 }
@@ -664,8 +675,9 @@ static void printStatus() {
   Serial.println();
   Serial.printf("==== can-proxy status  uptime %lu.%03lus ====\n",
                 (unsigned long)(now / 1000), (unsigned long)(now % 1000));
-  Serial.printf("mode=%s poll=%s passUnknown=%s fwdBcast=%s verify=%s verbose=%s\n",
-                modeName(g_mode), onOff(g_pollEnabled), onOff(g_passUnknown),
+  Serial.printf("mode=%s relay=%s poll=%s passUnknown=%s fwdBcast=%s verify=%s verbose=%s\n",
+                modeName(g_mode), g_relayOn ? "ON(Teensy)" : "OFF(thru)",
+                onOff(g_pollEnabled), onOff(g_passUnknown),
                 onOff(g_forwardBcast), onOff(g_verify), onOff(g_verbose));
   Serial.printf("CAR : rx=%lu tx=%lu txFail=%lu\n",
                 (unsigned long)g_stats.carRx, (unsigned long)g_stats.carTx, (unsigned long)g_stats.carTxFail);
@@ -709,6 +721,12 @@ static void setMode(Mode m) {
   Serial.printf("mode -> %s\n", modeName(g_mode));
 }
 
+// 切替リレー: ON = R-VIT は CAN Pal #2（Teensy）へ / OFF = 車両に直結
+static void setRelay(bool on) {
+  g_relayOn = on;
+  digitalWriteFast(PIN_RELAY, on ? HIGH : LOW);
+}
+
 static void handleSerial() {
   while (Serial.available()) {
     const char c = (char)Serial.read();
@@ -727,6 +745,9 @@ static void handleSerial() {
       case 'D': printBcastDump(millis()); break;
       case 'c': g_verify = !g_verify; g_poll.pending = false;
                 Serial.printf("verify=%s\n", onOff(g_verify)); break;
+      case 'x': setRelay(!g_relayOn);
+                Serial.printf("relay=%s\n", g_relayOn ? "ON (R-VIT <-> Teensy)" : "OFF (R-VIT <-> vehicle direct)");
+                break;
       case 'r': {
         g_stats = {};
         for (auto &e : g_dids) {
@@ -753,6 +774,23 @@ static void setupBus(Bus &bus, void (*handler)(const CAN_message_t &)) {
   bus.enableFIFO();           // 全 ID 受信
   bus.enableFIFOInterrupt();
   bus.onReceive(handler);
+}
+
+// ============================================================================
+// ウォッチドッグ（WDOG1）
+// ============================================================================
+//   loop() が WDT_WT で決まる時間止まると CPU をリセットする。リセット中・起動中は
+//   リレーのピンが入力（10kΩ プルダウン）になるので R-VIT は車両直結に戻る。
+//   WDE は一度セットすると次のリセットまで解除できない。
+static void wdtBegin() {
+  WDOG1_WMCR = 0;  // パワーダウンカウンタ無効
+  WDOG1_WCR  = WDOG_WCR_WT(WDT_WT) | WDOG_WCR_SRE | WDOG_WCR_WDA | WDOG_WCR_SRS |
+               WDOG_WCR_WDE | WDOG_WCR_WDZST;
+}
+
+static inline void wdtFeed() {
+  WDOG1_WSR = 0x5555;
+  WDOG1_WSR = 0xAAAA;
 }
 
 // ============================================================================
@@ -798,6 +836,12 @@ static void serviceUsbReattach(uint32_t now) {
 #ifndef CAN_LOOPBACK_TEST
 
 void setup() {
+  // リセット要因を記録してクリア（W1C）。次回のリセット要因を正しく残すため
+  g_wdtReset = (SRC_SRSR & SRC_SRSR_WDOG_RST_B) != 0;
+  SRC_SRSR   = SRC_SRSR;
+
+  pinMode(PIN_RELAY, OUTPUT);
+  setRelay(false);  // 初期化が終わるまでは車両直結のまま
   pinMode(PIN_LED, OUTPUT);
   digitalWriteFast(PIN_LED, LOW);
 
@@ -807,6 +851,9 @@ void setup() {
 
   setupBus(canCar, onCarFrame);
   setupBus(canRvit, onRvitFrame);
+
+  wdtBegin();
+  setRelay(true);   // 準備完了 -> R-VIT を Teensy 側へ切替
 }
 
 static void printBanner() {
@@ -814,8 +861,12 @@ static void printBanner() {
   Serial.println("=== can-proxy : Teensy 4.1 R-VIT proxy ===");
   Serial.println(" CAN1 (vehicle) : TX=pin22 RX=pin23  500kbps");
   Serial.println(" CAN3 (R-VIT)   : TX=pin31 RX=pin30  500kbps");
+  Serial.printf(" relay(pin%u)=%s  WDT=%.1fs\n", PIN_RELAY,
+                g_relayOn ? "ON (R-VIT <-> Teensy)" : "OFF (R-VIT <-> vehicle direct)",
+                (double)((WDT_WT + 1) * 0.5f));
   Serial.printf(" uptime=%lums  mode=%s  usb_reattach=%u  (h でヘルプ)\n",
                 (unsigned long)millis(), modeName(g_mode), g_usbReattachCount);
+  if (g_wdtReset) Serial.println(" !! 前回はウォッチドッグでリセットされた（loop() が停止していた）");
   if (CrashReport) Serial.print(CrashReport);  // 前回クラッシュ情報があれば表示
 }
 
@@ -828,6 +879,7 @@ static void serviceSerialConnect() {
 }
 
 void loop() {
+  wdtFeed();
   canCar.events();
   canRvit.events();
 
@@ -1155,6 +1207,9 @@ static void testHandleSerial(uint32_t now) {
 }
 
 void setup() {
+  // テストではリレー OFF のまま（CAN Pal #1/#2 のピン同士を直結して使う）
+  pinMode(PIN_RELAY, OUTPUT);
+  digitalWriteFast(PIN_RELAY, LOW);
   pinMode(PIN_LED, OUTPUT);
   digitalWriteFast(PIN_LED, LOW);
   Serial.begin(115200);
